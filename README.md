@@ -22,13 +22,17 @@ My qBittorrent lives in a Docker container behind a VPN, and another one runs on
 
 ## What it does
 
-- **Several servers**: save as many qBittorrent instances as you want (local Docker, seedbox, your friend's NAS...) and pick one to connect to automatically at startup.
-- **The torrent list you'd expect**: progress, speeds, ratio, ETA, category, filters by status and category, sorting, search.
-- **Multi-select**: tick a few torrents (Shift+click for a range, Ctrl+A for everything) and pause, resume, recheck, move, recategorize or delete them in one go.
+- **Several servers**: save as many qBittorrent instances as you want (local Docker, seedbox, your friend's NAS...) and pick one to connect to automatically at startup. Click the server name in the top bar to see the live speeds of all of them and switch in one click.
+- **The torrent list you'd expect**: progress, speeds, ratio, ETA, category, filters by status, category and tag, sorting, search.
+- **Multi-select**: tick a few torrents (Shift+click for a range, Ctrl+A for everything) and pause, resume, recheck, move, recategorize, tag, reorder in the queue or delete them in one go.
 - **Adding torrents, the lazy way**: paste a magnet link, pick a `.torrent` file, drag and drop it, press Ctrl+V anywhere, or just click a magnet link in Firefox. It ends up in the app even if it's already open.
 - **Remote folder browser**: choose where things are saved on the server by actually browsing its folders (qBittorrent 5.0+).
 - **Pick what you download**: untick the files you don't want before or after the download starts.
-- **Details window**: sequential download, first and last pieces first, force start, rename, category, per-torrent speed limits, and the tracker list, where you can add or remove trackers.
+- **Details window**: sequential download, first and last pieces first, force start, rename, category, per-torrent speed limits, the tracker list, where you can add or remove trackers, and the connected peers (address, client, country, speeds).
+- **Categories and tags**: create or delete them, change a category's default folder, tag torrents and filter by tag.
+- **Queue**: move torrents to the top, up, down or to the bottom of the queue.
+- **Speeds at a glance**: a small graph of the last 3 minutes and the global speed limits (⏱) right in the top bar.
+- **Keyboard shortcuts**: Space to pause or resume the selection, Enter for details, F5 to refresh, Ctrl+A, Del, Ctrl+F, Ctrl+O, Ctrl+V.
 - **Watched folders**: drop a `.torrent` in a local folder, it gets sent to the server with the folder and category you chose, then deleted.
 - **Auto-cleanup rules**: when a ratio or a seeding time is reached, pause the torrent, remove it, or remove it along with its files. The server applies these rules even when the app is closed.
 - **System tray**: closing the window keeps the app running in the tray, so notifications, watched folders and Firefox links keep working.
@@ -62,6 +66,8 @@ Choose the destination, the category and whether it starts right away. **Browse*
 
 ![Details: trackers](docs/en/details-trackers.png)
 
+![Details: peers](docs/en/details-peers.png)
+
 ### Settings
 
 ![General settings](docs/en/settings-general.png)
@@ -69,6 +75,8 @@ Choose the destination, the category and whether it starts right away. **Browse*
 ![Servers](docs/en/settings-servers.png)
 
 ![Watched folders](docs/en/settings-watch.png)
+
+![Categories and tags](docs/en/settings-categories.png)
 
 ![Server options](docs/en/settings-remote.png)
 

@@ -22,13 +22,17 @@ Chez moi, qBittorrent tourne dans un conteneur Docker derrière un VPN, et un au
 
 ## Ce qu'elle fait
 
-- **Plusieurs serveurs** : enregistre autant d'instances que tu veux (Docker local, seedbox, le NAS d'un pote...) et choisis celle qui se connecte toute seule au démarrage.
-- **La liste de torrents qu'on attend** : progression, vitesses, ratio, temps restant, catégorie, filtres par état et par catégorie, tri, recherche.
-- **Sélection multiple** : coche plusieurs torrents (Maj+clic pour une plage, Ctrl+A pour tout) puis mets-les en pause, relance, revérifie, déplace, change leur catégorie ou supprime-les d'un coup.
+- **Plusieurs serveurs** : enregistre autant d'instances que tu veux (Docker local, seedbox, le NAS d'un pote...) et choisis celle qui se connecte toute seule au démarrage. Clique sur le nom du serveur dans la barre du haut pour voir les vitesses de tous les autres et basculer en un clic.
+- **La liste de torrents qu'on attend** : progression, vitesses, ratio, temps restant, catégorie, filtres par état, par catégorie et par étiquette, tri, recherche.
+- **Sélection multiple** : coche plusieurs torrents (Maj+clic pour une plage, Ctrl+A pour tout) puis mets-les en pause, relance, revérifie, déplace, change leur catégorie, ajoute une étiquette, change leur place dans la file ou supprime-les d'un coup.
 - **Ajouter un torrent sans se fatiguer** : colle un lien magnet, choisis un `.torrent`, glisse-le dans la fenêtre, fais Ctrl+V n'importe où, ou clique simplement sur un lien magnet dans Firefox. Ça arrive dans l'appli, même si elle est déjà ouverte.
 - **Explorateur de dossiers distant** : choisis où enregistrer sur le serveur en parcourant vraiment ses dossiers (qBittorrent 5.0 et plus).
 - **Choisir ce qu'on télécharge** : décoche les fichiers dont tu ne veux pas, avant ou pendant le téléchargement.
-- **Fenêtre de détails** : téléchargement séquentiel, premier et dernier morceau en priorité, démarrage forcé, renommage, catégorie, limites de vitesse par torrent, et la liste des trackers, où l'on peut en ajouter ou en retirer.
+- **Fenêtre de détails** : téléchargement séquentiel, premier et dernier morceau en priorité, démarrage forcé, renommage, catégorie, limites de vitesse par torrent, la liste des trackers, où l'on peut en ajouter ou en retirer, et les pairs connectés (adresse, client, pays, vitesses).
+- **Catégories et étiquettes** : crée-les ou supprime-les, change le dossier par défaut d'une catégorie, colle des étiquettes sur tes torrents et filtre par étiquette.
+- **File d'attente** : place un torrent tout en haut, monte-le, descends-le ou envoie-le tout en bas.
+- **Les vitesses d'un coup d'œil** : un petit graphique des 3 dernières minutes et les limites globales (⏱) directement dans la barre du haut.
+- **Raccourcis clavier** : Espace pour mettre en pause ou relancer la sélection, Entrée pour les détails, F5 pour actualiser, Ctrl+A, Suppr, Ctrl+F, Ctrl+O, Ctrl+V.
 - **Dossiers surveillés** : dépose un `.torrent` dans un dossier local, il part vers le serveur avec la destination et la catégorie choisies, puis il est supprimé.
 - **Ménage automatique** : quand un ratio ou une durée de partage est atteint, mets le torrent en pause, retire-le, ou retire-le avec ses fichiers. C'est le serveur qui applique ces règles, même appli fermée.
 - **Zone de notification** : fermer la fenêtre laisse l'appli tourner dans la zone de notification, donc notifications, dossiers surveillés et liens Firefox continuent de marcher.
@@ -62,6 +66,8 @@ Choisis la destination, la catégorie et si ça démarre tout de suite. **Parcou
 
 ![Détails : trackers](docs/fr/details-trackers.png)
 
+![Détails : pairs](docs/fr/details-peers.png)
+
 ### Paramètres
 
 ![Paramètres généraux](docs/fr/settings-general.png)
@@ -69,6 +75,8 @@ Choisis la destination, la catégorie et si ça démarre tout de suite. **Parcou
 ![Serveurs](docs/fr/settings-servers.png)
 
 ![Dossiers surveillés](docs/fr/settings-watch.png)
+
+![Catégories et étiquettes](docs/fr/settings-categories.png)
 
 ![Réglages du serveur](docs/fr/settings-remote.png)
 

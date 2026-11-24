@@ -7,12 +7,12 @@ mod tray;
 const APP_NAME: &str = "qBit-Distant-UI";
 const APP_ID: &str = "qbit-distant-ui";
 
-use api::{AddOpts, Client, Prefs, Source, TFile, Torrent, Tracker};
+use api::{AddOpts, Client, Peer, Prefs, Source, TFile, Torrent, Tracker};
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke};
 use i18n::Lang;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -122,6 +122,7 @@ enum DTab {
     Info,
     Files,
     Trackers,
+    Peers,
 }
 
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -130,6 +131,7 @@ enum Tab {
     General,
     Servers,
     Watch,
+    Categories,
     Remote,
 }
 
@@ -201,7 +203,18 @@ struct Shared {
     quitting: bool,
     close_to_tray: bool,
     watchers: Vec<Watcher>,
+    tags: Vec<String>,
+    cat_paths: Vec<(String, String)>,
+    peers: Option<(String, Vec<Peer>)>,
+    history: VecDeque<(i64, i64)>,
+    others: Vec<(usize, Server)>,
+    overview: Vec<(usize, Speeds)>,
+    global_limits: Option<(i64, i64)>,
+    refresh: bool,
 }
+
+const HISTORY: usize = 90;
+type Speeds = Result<(i64, i64), String>;
 
 enum Target {
     Add,
@@ -245,6 +258,12 @@ struct App {
     visible: Vec<String>,
     new_trackers: String,
     logo: egui::TextureHandle,
+    tag: Option<String>,
+    new_tag: String,
+    glimits: Option<(i64, i64)>,
+    glimits_asked: bool,
+    cat_edit: Option<(String, String)>,
+    cat_new: (String, String),
 }
 
 fn finished(prev: &HashSet<String>, now: &[Torrent]) -> Vec<String> {
@@ -262,9 +281,11 @@ fn poll(sh: Arc<Mutex<Shared>>) {
             let r = c.torrents().and_then(|t| Ok((t, c.transfer()?)));
             let alt = c.alt_speed().ok();
             let cats = c.categories().ok();
+            let tags = c.tags().ok();
             let free = (tick % 15 == 0).then(|| c.free_space().ok()).flatten();
             let files = detail.clone().and_then(|h| c.files(&h).ok().map(|f| (h, f)));
-            let trackers = detail.and_then(|h| c.trackers(&h).ok().map(|f| (h, f)));
+            let trackers = detail.clone().and_then(|h| c.trackers(&h).ok().map(|f| (h, f)));
+            let peers = detail.and_then(|h| c.peers(&h).ok().map(|p| (h, p)));
             let mut done = Vec::new();
             let mut g = sh.lock().unwrap();
             if g.client.as_ref().is_some_and(|x| Arc::ptr_eq(x, &c)) {
@@ -276,6 +297,10 @@ fn poll(sh: Arc<Mutex<Shared>>) {
                         }
                         g.incomplete = Some(incomplete);
                         (g.torrents, g.dl, g.up, g.loaded) = (t, tr.dl_info_speed, tr.up_info_speed, true);
+                        g.history.push_back((tr.dl_info_speed, tr.up_info_speed));
+                        if g.history.len() > HISTORY {
+                            g.history.pop_front();
+                        }
                         if g.poll_error {
                             (g.error, g.poll_error) = (None, false);
                         }
@@ -286,7 +311,14 @@ fn poll(sh: Arc<Mutex<Shared>>) {
                     g.alt_speed = a;
                 }
                 if let Some(c) = cats {
-                    g.categories = c;
+                    g.categories = c.iter().map(|(n, _)| n.clone()).collect();
+                    g.cat_paths = c;
+                }
+                if let Some(t) = tags {
+                    g.tags = t;
+                }
+                if peers.as_ref().is_some_and(|(h, _)| g.detail.as_ref() == Some(h)) {
+                    g.peers = peers;
                 }
                 if let Some(f) = free {
                     g.free = f;
@@ -317,7 +349,38 @@ fn poll(sh: Arc<Mutex<Shared>>) {
             scan_watchers(&sh, &c);
             tick += 1;
         }
-        thread::sleep(Duration::from_secs(2));
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            if std::mem::take(&mut sh.lock().unwrap().refresh) {
+                break;
+            }
+        }
+    }
+}
+
+fn poll_others(sh: Arc<Mutex<Shared>>) {
+    let mut clients: HashMap<(String, String, String), Client> = HashMap::new();
+    let (mut seen, mut last) = (Vec::new(), None::<Instant>);
+    loop {
+        let others = {
+            let g = sh.lock().unwrap();
+            if g.client.is_some() { g.others.clone() } else { Vec::new() }
+        };
+        let keys: Vec<(usize, String, String, String)> = others.iter().map(|(i, sv)| (*i, sv.url.clone(), sv.user.clone(), sv.pass.clone())).collect();
+        if keys != seen || last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            sh.lock().unwrap().overview.retain(|o| keys.iter().any(|k| k.0 == o.0));
+            for (i, sv) in others {
+                let c = clients.entry((sv.url.clone(), sv.user.clone(), sv.pass.clone())).or_insert_with(|| Client::new(&sv.url, &sv.user, &sv.pass));
+                let r = c.transfer().map(|t| (t.dl_info_speed, t.up_info_speed));
+                let mut g = sh.lock().unwrap();
+                g.overview.retain(|o| o.0 != i);
+                g.overview.push((i, r));
+                drop(g);
+                repaint(&sh);
+            }
+            (seen, last) = (keys, Some(Instant::now()));
+        }
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -414,13 +477,20 @@ fn handle_cmd(sh: &Arc<Mutex<Shared>>, wake: &mpsc::Sender<tray::Cmd>, cmd: tray
 fn tray_status(sh: &Arc<Mutex<Shared>>) -> (String, [String; 4]) {
     let g = sh.lock().unwrap();
     let l = g.lang;
-    let tip = if g.client.is_some() { format!("⬇ {}/s   ⬆ {}/s", bytes(l, g.dl), bytes(l, g.up)) } else { l.t("connect").to_string() };
+    let mut tip = if g.client.is_some() { format!("⬇ {}/s   ⬆ {}/s", bytes(l, g.dl), bytes(l, g.up)) } else { l.t("connect").to_string() };
+    for (i, r) in &g.overview {
+        if let (Ok((d, u)), Some(sv)) = (r, g.others.iter().find(|o| o.0 == *i)) {
+            tip += &format!("\n{} : ⬇ {}/s   ⬆ {}/s", sv.1.label(), bytes(l, *d), bytes(l, *u));
+        }
+    }
     (tip, [l.t("tray_show"), l.t("start_all"), l.t("stop_all"), l.t("quit")].map(String::from))
 }
 
 fn start_background(sh: &Arc<Mutex<Shared>>, wake: mpsc::Sender<tray::Cmd>, desktop: bool) {
     let s = sh.clone();
     thread::spawn(move || poll(s));
+    let s = sh.clone();
+    thread::spawn(move || poll_others(s));
     if !desktop {
         return;
     }
@@ -507,6 +577,12 @@ impl App {
             anchor: None,
             visible: Vec::new(),
             new_trackers: String::new(),
+            tag: None,
+            new_tag: String::new(),
+            glimits: None,
+            glimits_asked: false,
+            cat_edit: None,
+            cat_new: Default::default(),
             logo: {
                 let i = tray::icon(64);
                 cc.egui_ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied([i.width as usize, i.height as usize], &i.rgba), egui::TextureOptions::LINEAR)
@@ -531,7 +607,9 @@ impl App {
         {
             let mut g = sh.lock().unwrap();
             (g.busy, g.client, g.loaded, g.detail, g.files, g.incomplete, g.free) = (true, None, false, None, None, None, -1);
+            g.peers = None;
             g.torrents.clear();
+            g.history.clear();
         }
         thread::spawn(move || {
             let r = c.login().map(|_| c.default_save_path().unwrap_or_default());
@@ -547,8 +625,9 @@ impl App {
 
     fn disconnect(&mut self) {
         let mut g = self.shared.lock().unwrap();
-        (g.client, g.loaded, g.dl, g.up, g.detail, g.files) = (None, false, 0, 0, None, None);
+        (g.client, g.loaded, g.dl, g.up, g.detail, g.files, g.peers) = (None, false, 0, 0, None, None, None);
         g.torrents.clear();
+        g.history.clear();
         drop(g);
         (self.prefs_edit, self.prefs_requested) = (None, false);
     }
@@ -632,7 +711,7 @@ impl App {
 
     fn open_details(&mut self, hash: &str) {
         let mut g = self.shared.lock().unwrap();
-        (g.detail, g.files, g.trackers) = (Some(hash.to_string()), None, None);
+        (g.detail, g.files, g.trackers, g.peers) = (Some(hash.to_string()), None, None, None);
         drop(g);
         (self.detail_tab, self.rename, self.limits) = (DTab::Info, None, None);
     }
@@ -680,6 +759,8 @@ impl App {
                     })
                     .response
                     .accessible_name(l.t("set_category"));
+                ui.menu_button(format!("🔖 {}", l.t("tags")), |ui| self.tags_menu(ui, &hashes));
+                ui.menu_button(l.t("queue"), |ui| self.queue_menu(ui, &hashes));
                 move_req = ui.button(l.t("move")).clicked();
                 if ui.button(format!("🗑 {}", l.t("delete"))).clicked() {
                     self.ask_delete_selection();
@@ -699,6 +780,73 @@ impl App {
         ui.add_space(8.0);
     }
 
+    fn queue_menu(&self, ui: &mut egui::Ui, hashes: &str) {
+        let l = self.s.lang;
+        for (act, k) in [("topPrio", "queue_top"), ("increasePrio", "queue_up"), ("decreasePrio", "queue_down"), ("bottomPrio", "queue_bottom")] {
+            if ui.button(l.t(k)).clicked() {
+                let h = hashes.to_string();
+                self.run(move |c| c.queue(&h, act));
+                ui.close();
+            }
+        }
+    }
+
+    fn tags_menu(&mut self, ui: &mut egui::Ui, hashes: &str) {
+        let l = self.s.lang;
+        let tags = self.shared.lock().unwrap().tags.clone();
+        let mut act: Option<(String, bool)> = None;
+        for t in &tags {
+            ui.horizontal(|ui| {
+                if ui.small_button("➕").on_hover_text(l.t("add_tag")).clicked() {
+                    act = Some((t.clone(), true));
+                }
+                if ui.small_button("✖").on_hover_text(l.t("remove_tag")).clicked() {
+                    act = Some((t.clone(), false));
+                }
+                ui.label(t);
+            });
+        }
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.new_tag).hint_text(l.t("new_tag")).desired_width(140.0)).accessible_name(l.t("new_tag"));
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.add_enabled(!self.new_tag.trim().is_empty(), egui::Button::new("➕")).on_hover_text(l.t("add_tag")).clicked() || enter) && !self.new_tag.trim().is_empty() {
+                act = Some((std::mem::take(&mut self.new_tag).trim().to_string(), true));
+            }
+        });
+        if let Some((tag, add)) = act {
+            let h = hashes.to_string();
+            self.run(move |c| if add { c.add_tags(&h, &tag) } else { c.remove_tags(&h, &tag) });
+        }
+    }
+
+    fn limits_menu(&mut self, ui: &mut egui::Ui) {
+        let l = self.s.lang;
+        if let Some((d, u)) = self.shared.lock().unwrap().global_limits.take() {
+            self.glimits = Some((d.max(0) / 1024, u.max(0) / 1024));
+        }
+        ui.label(RichText::new(l.t("global_limits")).strong());
+        let Some((dl, up)) = &mut self.glimits else {
+            if !std::mem::replace(&mut self.glimits_asked, true) {
+                self.fetch(|c| c.prefs(), |g, p| g.global_limits = Some((p.dl_limit, p.up_limit)));
+            }
+            ui.spinner();
+            return;
+        };
+        egui::Grid::new("glimits").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            for (k, v) in [("dl_short", &mut *dl), ("up_short", &mut *up)] {
+                ui.label(l.t(k));
+                ui.add(egui::DragValue::new(v).range(0..=10_000_000).suffix(" KiB/s")).accessible_name(l.t(k));
+                ui.end_row();
+            }
+        });
+        if ui.button(l.t("apply")).clicked() {
+            let (d, u) = (*dl * 1024, *up * 1024);
+            let msg = l.t("saved").to_string();
+            self.fetch(move |c| c.set_global_limits(d, u), move |g, ()| g.info = Some((msg, Instant::now())));
+            ui.close();
+        }
+    }
+
     fn pick_torrents(&self) {
         if let Some(files) = rfd::FileDialog::new().add_filter("Torrent", &["torrent"]).pick_files() {
             self.shared.lock().unwrap().incoming.extend(files.into_iter().map(|p| p.to_string_lossy().into_owned()));
@@ -710,7 +858,7 @@ impl App {
             return;
         }
         let typing = ctx.memory(|m| m.focused().is_some());
-        let (open, find, pasted, all, del, esc) = ctx.input(|i| {
+        let (open, find, pasted, all, del, esc, space, enter, f5) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(egui::Key::O),
                 i.modifiers.command && i.key_pressed(egui::Key::F),
@@ -718,6 +866,9 @@ impl App {
                 i.modifiers.command && i.key_pressed(egui::Key::A),
                 i.key_pressed(egui::Key::Delete),
                 i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::F5),
             )
         });
         let dialogs = self.to_delete.is_some() || !self.adds.is_empty() || self.explorer.is_some();
@@ -729,6 +880,18 @@ impl App {
         }
         if !typing && esc && !dialogs {
             self.selected.clear();
+        }
+        if !typing && space && !dialogs && !self.selected.is_empty() {
+            let run = self.shared.lock().unwrap().torrents.iter().filter(|t| self.selected.contains(&t.hash)).all(|t| state_label(&t.state).1);
+            let h = self.selected.iter().cloned().collect::<Vec<_>>().join("|");
+            self.run(move |c| c.set_running(&h, run));
+        }
+        if !typing && enter && !dialogs && self.selected.len() == 1 {
+            let h = self.selected.iter().next().cloned().unwrap();
+            self.open_details(&h);
+        }
+        if f5 {
+            self.shared.lock().unwrap().refresh = true;
         }
         if open {
             self.pick_torrents();
@@ -757,11 +920,48 @@ impl App {
                     let (cdl, cup) = speed_colors(ui);
                     ui.label(RichText::new(format!("⬇ {}/s", bytes(l, dl))).color(cdl));
                     ui.label(RichText::new(format!("⬆ {}/s", bytes(l, up))).color(cup));
+                    let hist = self.shared.lock().unwrap().history.clone();
+                    let peak = hist.iter().map(|(d, u)| (*d).max(*u)).max().unwrap_or(0);
+                    sparkline(ui, &hist).on_hover_text(format!("{} · max {}/s", l.t("speed_history"), bytes(l, peak)));
                     if ui.selectable_label(alt, "🐢").on_hover_text(l.t("alt_speed")).clicked() {
                         self.run(|c| c.toggle_alt_speed());
                         self.shared.lock().unwrap().alt_speed = !alt;
                     }
-                    ui.label(RichText::new(self.s.servers.get(self.s.selected).map(Server::label).unwrap_or_default()).weak());
+                    let lm = ui.menu_button("⏱", |ui| self.limits_menu(ui));
+                    if lm.inner.is_none() {
+                        (self.glimits, self.glimits_asked) = (None, false);
+                    }
+                    lm.response.on_hover_text(l.t("global_limits"));
+                    let label = self.s.servers.get(self.s.selected).map(Server::label).unwrap_or_default().to_string();
+                    let mut switch = None;
+                    ui.menu_button(RichText::new(format!("{label} ⏷")).weak(), |ui| {
+                        let ov = self.shared.lock().unwrap().overview.clone();
+                        ui.label(RichText::new(l.t("all_servers")).strong());
+                        egui::Grid::new("overview").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                            for (i, sv) in self.s.servers.iter().enumerate() {
+                                if i == self.s.selected {
+                                    ui.label(RichText::new(sv.label()).strong());
+                                    ui.label(format!("⬇ {}/s   ⬆ {}/s", bytes(l, dl), bytes(l, up)));
+                                    ui.label(RichText::new(l.t("current")).weak());
+                                } else {
+                                    ui.label(sv.label());
+                                    match ov.iter().find(|o| o.0 == i).map(|o| &o.1) {
+                                        Some(Ok((d, u))) => ui.label(format!("⬇ {}/s   ⬆ {}/s", bytes(l, *d), bytes(l, *u))),
+                                        Some(Err(e)) => ui.colored_label(Color32::from_rgb(235, 90, 90), l.msg(e)),
+                                        None => ui.spinner(),
+                                    };
+                                    if ui.small_button(l.t("connect")).clicked() {
+                                        switch = Some(i);
+                                        ui.close();
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    if let Some(i) = switch {
+                        self.connect(i);
+                    }
                     let free = self.shared.lock().unwrap().free;
                     if free >= 0 {
                         ui.label(RichText::new(format!("🖴 {} {}", bytes(l, free), l.t("free_space"))).weak());
@@ -817,7 +1017,10 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let l = self.s.lang;
-        let cats = self.shared.lock().unwrap().categories.clone();
+        let (cats, tags) = {
+            let g = self.shared.lock().unwrap();
+            (g.categories.clone(), g.tags.clone())
+        };
         glass(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button(format!("🗁 {}", l.t("open_file"))).on_hover_text(l.t("shortcuts")).clicked() {
@@ -864,6 +1067,18 @@ impl App {
                     })
                     .response
                     .accessible_name(l.t("category"));
+                if !tags.is_empty() || self.tag.is_some() {
+                    egui::ComboBox::from_id_salt("tag")
+                        .selected_text(self.tag.clone().unwrap_or_else(|| l.t("tag_all").into()))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.tag, None, l.t("tag_all"));
+                            for t in &tags {
+                                ui.selectable_value(&mut self.tag, Some(t.clone()), t);
+                            }
+                        })
+                        .response
+                        .accessible_name(l.t("tags"));
+                }
                 let sorts = [
                     (Sort::Added, "sort_added"),
                     (Sort::Name, "sort_name"),
@@ -911,6 +1126,12 @@ impl App {
             ui.ctx().copy_text(t.magnet_uri.clone());
             ui.close();
         }
+        if ui.button(l.t("copy_hash")).clicked() {
+            ui.ctx().copy_text(t.hash.clone());
+            ui.close();
+        }
+        ui.menu_button(l.t("queue"), |ui| self.queue_menu(ui, &t.hash));
+        ui.menu_button(format!("🔖 {}", l.t("tags")), |ui| self.tags_menu(ui, &t.hash));
     }
 
     fn list(&mut self, ui: &mut egui::Ui) {
@@ -924,7 +1145,7 @@ impl App {
             let list = g
                 .torrents
                 .iter()
-                .filter(|t| (f.is_empty() || t.name.to_lowercase().contains(&f)) && matches(self.status, t) && self.category.as_ref().is_none_or(|c| &t.category == c))
+                .filter(|t| (f.is_empty() || t.name.to_lowercase().contains(&f)) && matches(self.status, t) && self.category.as_ref().is_none_or(|c| &t.category == c) && self.tag.as_ref().is_none_or(|x| has_tag(t, x)))
                 .cloned()
                 .collect();
             (g.loaded, list)
@@ -1004,6 +1225,12 @@ impl App {
                         );
                         if !t.category.is_empty() {
                             ui.label(RichText::new(format!("🏷 {}", t.category)).small());
+                        }
+                        if !t.tags.is_empty() {
+                            ui.label(RichText::new(format!("🔖 {}", t.tags)).small());
+                        }
+                        if t.priority > 0 {
+                            ui.label(RichText::new(format!("#{}", t.priority)).small().weak()).on_hover_text(l.t("queue"));
                         }
                     });
                 });
@@ -1170,14 +1397,15 @@ impl App {
 
     fn details_window(&mut self, ctx: &egui::Context) {
         let l = self.s.lang;
-        let (hash, t, files, trackers, cats, files_tab) = {
+        let (hash, t, files, trackers, peers, cats, files_tab) = {
             let mut g = self.shared.lock().unwrap();
             let Some(h) = g.detail.clone() else { return };
             let t = g.torrents.iter().find(|t| t.hash == h).cloned();
             let files = g.files.as_ref().filter(|(fh, _)| *fh == h).map(|(_, f)| f.clone());
             let trackers = g.trackers.as_ref().filter(|(th, _)| *th == h).map(|(_, f)| f.clone());
+            let peers = g.peers.as_ref().filter(|(ph, _)| *ph == h).map(|(_, p)| p.clone());
             let files_tab = std::mem::take(&mut g.want_files_tab);
-            (h, t, files, trackers, g.categories.clone(), files_tab)
+            (h, t, files, trackers, peers, g.categories.clone(), files_tab)
         };
         if files_tab {
             self.detail_tab = DTab::Files;
@@ -1221,7 +1449,7 @@ impl App {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                for (tab, k) in [(DTab::Info, "info"), (DTab::Files, "files"), (DTab::Trackers, "trackers")] {
+                for (tab, k) in [(DTab::Info, "info"), (DTab::Files, "files"), (DTab::Trackers, "trackers"), (DTab::Peers, "peers")] {
                     ui.selectable_value(&mut self.detail_tab, tab, l.t(k));
                 }
             });
@@ -1384,11 +1612,39 @@ impl App {
                         }
                     }
                 }
+                DTab::Peers => match &peers {
+                    Some(list) if !list.is_empty() => {
+                        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+                            egui::Grid::new("peers").num_columns(6).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+                                for k in ["address", "client", "country", "sort_progress", "dl_short", "up_short"] {
+                                    ui.label(RichText::new(l.t(k)).strong());
+                                }
+                                ui.end_row();
+                                for p in list {
+                                    let addr = if p.ip.contains(':') { format!("[{}]:{}", p.ip, p.port) } else { format!("{}:{}", p.ip, p.port) };
+                                    ui.label(RichText::new(addr).monospace());
+                                    ui.label(&p.client);
+                                    ui.label(&p.country);
+                                    ui.label(format!("{:.1} %", p.progress * 100.0));
+                                    ui.label(format!("{}/s", bytes(l, p.dl_speed)));
+                                    ui.label(format!("{}/s", bytes(l, p.up_speed)));
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    }
+                    Some(_) => {
+                        ui.label(RichText::new(l.t("no_peer")).weak());
+                    }
+                    None => {
+                        ui.spinner();
+                    }
+                },
             }
         });
         if !open {
             let mut g = self.shared.lock().unwrap();
-            (g.detail, g.files, g.trackers) = (None, None, None);
+            (g.detail, g.files, g.trackers, g.peers) = (None, None, None, None);
             drop(g);
             (self.rename, self.limits) = (None, None);
             return;
@@ -1431,7 +1687,7 @@ impl App {
             });
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                for (tab, k) in [(Tab::General, "tab_general"), (Tab::Servers, "tab_servers"), (Tab::Watch, "tab_watch"), (Tab::Remote, "tab_remote")] {
+                for (tab, k) in [(Tab::General, "tab_general"), (Tab::Servers, "tab_servers"), (Tab::Watch, "tab_watch"), (Tab::Categories, "tab_categories"), (Tab::Remote, "tab_remote")] {
                     ui.selectable_value(&mut self.tab, tab, l.t(k));
                 }
             });
@@ -1444,6 +1700,7 @@ impl App {
                     Tab::General => self.tab_general(ui),
                     Tab::Servers => self.tab_servers(ui),
                     Tab::Watch => self.tab_watch(ui, connected),
+                    Tab::Categories => self.tab_categories(ui, connected),
                     Tab::Remote => self.tab_remote(ui, connected),
                 }
             });
@@ -1599,6 +1856,89 @@ impl App {
         }
     }
 
+    fn tab_categories(&mut self, ui: &mut egui::Ui, connected: bool) {
+        let l = self.s.lang;
+        if !connected {
+            ui.label(RichText::new(l.t("connect_first")).weak());
+            return;
+        }
+        let (cats, tags) = {
+            let g = self.shared.lock().unwrap();
+            (g.cat_paths.clone(), g.tags.clone())
+        };
+        type Act = Box<dyn FnOnce(&Client) -> Result<(), String> + Send>;
+        let mut act: Option<Act> = None;
+        let (mut save, mut cancel, mut start) = (false, false, None);
+        ui.label(RichText::new(l.t("categories")).strong());
+        egui::Grid::new("cats").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+            for (name, path) in &cats {
+                ui.label(name);
+                match &mut self.cat_edit {
+                    Some((n, p)) if n == name => {
+                        let r = ui.add(egui::TextEdit::singleline(p).desired_width(320.0)).accessible_name(l.t("cat_path"));
+                        save |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.horizontal(|ui| {
+                            save |= ui.button(l.t("save")).clicked();
+                            cancel |= ui.button(l.t("cancel")).clicked();
+                        });
+                    }
+                    _ => {
+                        ui.label(RichText::new(if path.is_empty() { "–" } else { path }).monospace());
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✏").on_hover_text(l.t("cat_path")).clicked() {
+                                start = Some((name.clone(), path.clone()));
+                            }
+                            if ui.small_button("🗑").on_hover_text(l.t("delete")).clicked() {
+                                let n = name.clone();
+                                act = Some(Box::new(move |c| c.remove_category(&n)));
+                            }
+                        });
+                    }
+                }
+                ui.end_row();
+            }
+        });
+        if save && let Some((n, p)) = self.cat_edit.take() {
+            act = Some(Box::new(move |c| c.edit_category(&n, p.trim())));
+        }
+        if cancel {
+            self.cat_edit = None;
+        }
+        if start.is_some() {
+            self.cat_edit = start;
+        }
+        ui.horizontal(|ui| {
+            let (name, path) = &mut self.cat_new;
+            ui.add(egui::TextEdit::singleline(name).hint_text(l.t("new_category")).desired_width(180.0)).accessible_name(l.t("new_category"));
+            ui.add(egui::TextEdit::singleline(path).hint_text(l.t("cat_path")).desired_width(260.0)).accessible_name(l.t("cat_path"));
+            if ui.add_enabled(!name.trim().is_empty(), egui::Button::new(format!("➕ {}", l.t("create")))).clicked() {
+                let (n, p) = std::mem::take(&mut self.cat_new);
+                act = Some(Box::new(move |c| c.create_category(n.trim(), p.trim())));
+            }
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(RichText::new(l.t("tags")).strong());
+        ui.horizontal_wrapped(|ui| {
+            for t in &tags {
+                if ui.button(format!("🔖 {t}  ✖")).on_hover_text(l.t("delete")).clicked() {
+                    let t = t.clone();
+                    act = Some(Box::new(move |c| c.delete_tags(&t)));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.new_tag).hint_text(l.t("new_tag")).desired_width(180.0)).accessible_name(l.t("new_tag"));
+            if ui.add_enabled(!self.new_tag.trim().is_empty(), egui::Button::new(format!("➕ {}", l.t("create")))).clicked() {
+                let t = std::mem::take(&mut self.new_tag).trim().to_string();
+                act = Some(Box::new(move |c| c.create_tags(&t)));
+            }
+        });
+        if let Some(a) = act {
+            self.fetch(a, |g, ()| g.refresh = true);
+        }
+    }
+
     fn tab_remote(&mut self, ui: &mut egui::Ui, connected: bool) {
         let l = self.s.lang;
         if !connected {
@@ -1701,6 +2041,22 @@ fn parent(p: &str) -> String {
 
 fn leaf(p: &str) -> &str {
     p.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(p)
+}
+
+fn has_tag(t: &Torrent, tag: &str) -> bool {
+    t.tags.split(',').any(|x| x.trim() == tag)
+}
+
+fn sparkline(ui: &mut egui::Ui, hist: &VecDeque<(i64, i64)>) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(90.0, 22.0), egui::Sense::hover());
+    let max = hist.iter().map(|(d, u)| (*d).max(*u)).max().unwrap_or(0).max(1) as f32;
+    let step = rect.width() / (HISTORY - 1) as f32;
+    let (cdl, cup) = speed_colors(ui);
+    for (up, color) in [(false, cdl), (true, cup)] {
+        let pts = hist.iter().rev().enumerate().map(|(i, s)| egui::pos2(rect.right() - i as f32 * step, rect.bottom() - (if up { s.1 } else { s.0 }) as f32 / max * rect.height())).collect();
+        ui.painter().add(egui::Shape::line(pts, Stroke::new(1.5, color)));
+    }
+    resp
 }
 
 fn matches(s: Status, t: &Torrent) -> bool {
@@ -1856,6 +2212,7 @@ impl eframe::App for App {
             g.incoming.extend(dropped);
             (g.notify, g.lang, g.close_to_tray) = (self.s.notify_done, self.s.lang, self.s.close_to_tray);
             g.watchers.clone_from(&self.s.watchers);
+            g.others = self.s.servers.iter().cloned().enumerate().filter(|(i, _)| *i != self.s.selected).collect();
             (g.client.is_some(), g.busy)
         };
         let ctx = ui.ctx().clone();
@@ -2220,7 +2577,7 @@ mod screenshots {
                     "dlspeed": dl, "upspeed": up, "ratio": ratio, "eta": eta, "category": cat,
                     "added_on": 1_790_000_000 - i as i64 * 3600, "save_path": format!("/downloads/{}", if cat.is_empty() { "misc" } else { cat }),
                     "magnet_uri": format!("magnet:?xt=urn:btih:{}", hash(i as u8 + 1)), "num_seeds": seeds, "num_leechs": leechs,
-                    "seq_dl": i == 0, "f_l_piece_prio": i == 0, "force_start": false, "dl_limit": 0, "up_limit": if i == 0 { 512 * 1024 } else { 0 },
+                    "seq_dl": i == 0, "f_l_piece_prio": i == 0, "force_start": false, "dl_limit": 0, "tags": (["4K, seedbox", "", "", "seedbox"].get(i).copied().unwrap_or("")), "priority": (if *state == "queuedDL" { 1 } else { 0 }), "up_limit": if i == 0 { 512 * 1024 } else { 0 },
                 })
             })
             .collect()
@@ -2234,7 +2591,9 @@ mod screenshots {
             "transfer/speedLimitsMode" => return "0".into(),
             "torrents/info" => torrents(),
             "transfer/info" => json!({ "dl_info_speed": 30 * MB + 400_000, "up_info_speed": 5 * MB + 670_000 }),
-            "torrents/categories" => json!({ "Linux ISOs": {}, "Music": {}, "Totally legal": {} }),
+            "torrents/categories" => json!({ "Linux ISOs": { "savePath": "/downloads/Linux ISOs" }, "Music": {}, "Totally legal": {} }),
+            "torrents/tags" => json!(["4K", "seedbox"]),
+            "sync/torrentPeers" => json!({ "peers": { "203.0.113.7:51413": { "ip": "203.0.113.7", "port": 51413, "client": "qBittorrent 5.1.0", "country": "France", "progress": 0.82, "dl_speed": 2 * MB, "up_speed": 64_000 } } }),
             "sync/maindata" => json!({ "server_state": { "free_space_on_disk": 2 * 1024 * GB + 600 * GB } }),
             "app/getDirectoryContent" => json!(["/downloads/Linux ISOs", "/downloads/Movies (the legal ones)", "/downloads/Music", "/downloads/Totally legal", "/downloads/misc"]),
             "torrents/files" => json!([
@@ -2336,6 +2695,9 @@ mod screenshots {
             snap(&mut h, "details-files");
             h.state_mut().detail_tab = DTab::Trackers;
             snap(&mut h, "details-trackers");
+            h.state_mut().detail_tab = DTab::Peers;
+            ui_live::wait(&mut h, "pairs", |_, s| s.peers.is_some());
+            snap(&mut h, "details-peers");
             h.state_mut().shared.lock().unwrap().detail = None;
             h.state_mut().queue(Source::Urls("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=linuxmint-22.3-cinnamon-64bit.iso".into()));
             snap(&mut h, "add");
@@ -2344,7 +2706,7 @@ mod screenshots {
             snap(&mut h, "explorer");
             (h.state_mut().explorer, h.state_mut().adds) = (None, VecDeque::new());
             h.state_mut().page = Page::Settings;
-            for (tab, name) in [(Tab::General, "settings-general"), (Tab::Servers, "settings-servers"), (Tab::Watch, "settings-watch"), (Tab::Remote, "settings-remote")] {
+            for (tab, name) in [(Tab::General, "settings-general"), (Tab::Servers, "settings-servers"), (Tab::Watch, "settings-watch"), (Tab::Categories, "settings-categories"), (Tab::Remote, "settings-remote")] {
                 h.state_mut().tab = tab;
                 if tab == Tab::Remote {
                     ui_live::wait(&mut h, "préférences", |a, _| a.prefs_edit.is_some());
@@ -2354,7 +2716,7 @@ mod screenshots {
             h.state_mut().page = Page::Torrents;
             h.ctx.set_theme(egui::ThemePreference::Light);
             snap(&mut h, "light");
-            let order = ["list", "selection", "details-info", "details-files", "details-trackers", "add", "explorer", "settings-general", "settings-watch", "light"];
+            let order = ["list", "selection", "details-info", "details-files", "details-trackers", "details-peers", "add", "explorer", "settings-general", "settings-watch", "light"];
             let status = std::process::Command::new("magick")
                 .args(["-delay", "200", "-loop", "0"])
                 .args(order.iter().map(|n| format!("{dir}/{n}.png")))

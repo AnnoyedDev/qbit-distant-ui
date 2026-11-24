@@ -25,6 +25,20 @@ pub struct Torrent {
     pub up_limit: i64,
     pub num_seeds: i64,
     pub num_leechs: i64,
+    pub tags: String,
+    pub priority: i64,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct Peer {
+    pub ip: String,
+    pub port: i64,
+    pub client: String,
+    pub country: String,
+    pub progress: f64,
+    pub dl_speed: i64,
+    pub up_speed: i64,
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -131,7 +145,8 @@ impl Client {
     }
 
     fn call(&self, f: impl Fn(Option<String>) -> Result<String, Error>) -> Result<String, Error> {
-        match f(self.cookie.lock().unwrap().clone()) {
+        let cookie = self.cookie.lock().unwrap().clone();
+        match f(cookie) {
             Err(Error::StatusCode(403)) => {
                 self.login().map_err(|_| Error::StatusCode(401))?;
                 f(self.cookie.lock().unwrap().clone())
@@ -185,10 +200,65 @@ impl Client {
         self.act("transfer/toggleSpeedLimitsMode", &[])
     }
 
-    pub fn categories(&self) -> Res<Vec<String>> {
+    pub fn categories(&self) -> Res<Vec<(String, String)>> {
         let map: HashMap<String, serde_json::Value> = self.json("torrents/categories", &[])?;
-        let mut v: Vec<String> = map.into_keys().collect();
-        v.sort_by_key(|c| c.to_lowercase());
+        let mut v: Vec<(String, String)> = map.into_iter().map(|(k, c)| (k, c["savePath"].as_str().unwrap_or_default().to_string())).collect();
+        v.sort_by_key(|(c, _)| c.to_lowercase());
+        Ok(v)
+    }
+
+    pub fn create_category(&self, name: &str, path: &str) -> Res<()> {
+        self.act("torrents/createCategory", &[("category", name), ("savePath", path)])
+    }
+
+    pub fn edit_category(&self, name: &str, path: &str) -> Res<()> {
+        self.act("torrents/editCategory", &[("category", name), ("savePath", path)])
+    }
+
+    pub fn remove_category(&self, name: &str) -> Res<()> {
+        self.act("torrents/removeCategories", &[("categories", name)])
+    }
+
+    pub fn tags(&self) -> Res<Vec<String>> {
+        let mut v: Vec<String> = self.json("torrents/tags", &[])?;
+        v.sort_by_key(|t| t.to_lowercase());
+        Ok(v)
+    }
+
+    pub fn add_tags(&self, hashes: &str, tags: &str) -> Res<()> {
+        self.act("torrents/addTags", &[("hashes", hashes), ("tags", tags)])
+    }
+
+    pub fn remove_tags(&self, hashes: &str, tags: &str) -> Res<()> {
+        self.act("torrents/removeTags", &[("hashes", hashes), ("tags", tags)])
+    }
+
+    pub fn create_tags(&self, tags: &str) -> Res<()> {
+        self.act("torrents/createTags", &[("tags", tags)])
+    }
+
+    pub fn delete_tags(&self, tags: &str) -> Res<()> {
+        self.act("torrents/deleteTags", &[("tags", tags)])
+    }
+
+    pub fn queue(&self, hashes: &str, action: &str) -> Res<()> {
+        self.act(&format!("torrents/{action}"), &[("hashes", hashes)]).map_err(|e| if e == "err_rejected" { "err_queue".into() } else { e })
+    }
+
+    pub fn set_global_limits(&self, dl: i64, up: i64) -> Res<()> {
+        self.act("transfer/setDownloadLimit", &[("limit", &dl.max(0).to_string())])?;
+        self.act("transfer/setUploadLimit", &[("limit", &up.max(0).to_string())])
+    }
+
+    pub fn peers(&self, hash: &str) -> Res<Vec<Peer>> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct R {
+            peers: HashMap<String, Peer>,
+        }
+        let r: R = self.json("sync/torrentPeers", &[("hash", hash), ("rid", "0")])?;
+        let mut v: Vec<Peer> = r.peers.into_values().collect();
+        v.sort_by_key(|p| std::cmp::Reverse(p.dl_speed + p.up_speed));
         Ok(v)
     }
 
@@ -397,6 +467,42 @@ mod tests {
     }
 
     #[test]
+    fn relogin_after_403() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(&s);
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                let (mut len, mut cookie) = (0, false);
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).is_err() || h.trim().is_empty() {
+                        break;
+                    }
+                    let h = h.to_ascii_lowercase();
+                    cookie |= h.starts_with("cookie:");
+                    if let Some(v) = h.strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let _ = r.read_exact(&mut vec![0; len]);
+                let (status, extra, body) = match (line.contains("auth/login"), cookie) {
+                    (true, _) => ("200 OK", "Set-Cookie: SID=x\r\n", "Ok."),
+                    (false, true) => ("200 OK", "", r#"{"dl_info_speed":1,"up_info_speed":2}"#),
+                    (false, false) => ("403 Forbidden", "", "Forbidden"),
+                };
+                let _ = (&s).write_all(format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(Client::new(&format!("http://{addr}"), "u", "p").transfer().map(|t| t.dl_info_speed)));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("blocage sur 403"), Ok(1));
+    }
+
+    #[test]
     fn parse_torrent() {
         let j = r#"[{"hash":"h","name":"n","size":10,"progress":0.5,"dlspeed":1,"upspeed":2,"state":"stoppedDL","ratio":0.1,"eta":8640000,"extra":1}]"#;
         let t: Vec<Torrent> = serde_json::from_str(j).unwrap();
@@ -416,12 +522,14 @@ fn live_server() {
     c.transfer().unwrap();
     c.alt_speed().unwrap();
     c.categories().unwrap();
+    c.tags().unwrap();
     c.prefs().unwrap();
     assert!(!c.default_save_path().unwrap().is_empty());
     assert!(c.free_space().unwrap() > 0);
     if let Some(t) = t.first() {
         assert!(!c.files(&t.hash).unwrap().is_empty());
         c.trackers(&t.hash).unwrap();
+        c.peers(&t.hash).unwrap();
         println!("premier : {} ({})", t.name, t.state);
     }
 }
